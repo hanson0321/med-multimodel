@@ -1,0 +1,201 @@
+import os
+import torch
+import nibabel as nib
+import pandas as pd
+import numpy as np
+from PIL import Image
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import f1_score
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+# 讀取臨床與代謝體數據
+clinical_metabolomics_data = pd.read_csv('/usr1/wayne1029/Project/merged_data.csv')
+
+# 分離特徵與目標變量
+X = clinical_metabolomics_data.drop(columns=['CFS'])  # 假設 "CFS" 是目標變量
+y = clinical_metabolomics_data['CFS']
+
+# 特徵縮放
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# 處理心電圖數據
+class ECGDataset(Dataset):
+    def __init__(self, ecg_dir, transform=None):
+        self.ecg_dir = ecg_dir
+        self.transform = transform
+        self.image_files = [f for f in os.listdir(ecg_dir) if f.endswith('.png')]
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.ecg_dir, self.image_files[idx])
+        img = Image.open(img_name).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img
+
+# 處理 MRI 數據
+class MRIDataset(Dataset):
+    def __init__(self, mri_dir):
+        self.mri_dir = mri_dir
+        self.mri_files = [f for f in os.listdir(mri_dir) if f.endswith('.nii.gz')]
+
+    def __len__(self):
+        return len(self.mri_files)
+
+    def __getitem__(self, idx):
+        nii_file = os.path.join(self.mri_dir, self.mri_files[idx])
+        nii_img = nib.load(nii_file).get_fdata()  # 讀取3D數據
+        nii_img = (nii_img - np.min(nii_img)) / (np.max(nii_img) - np.min(nii_img))  # 標準化
+        nii_img = nii_img[128, :, :]  # 提取中間切片
+        nii_img = np.expand_dims(nii_img, axis=0)  # 增加通道維度
+        nii_img = torch.tensor(nii_img, dtype=torch.float32)
+        return nii_img
+
+# 處理臨床與代謝體數據
+class ClinicalDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = features
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+# 數據增強和轉換
+ecg_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+ecg_dataset = ECGDataset('/usr1/wayne1029/Project/EKG_png', transform=ecg_transform)
+mri_dataset = MRIDataset('/usr1/wayne1029/Project/MRI/MRI_demo_data2')
+
+ecg_loader = DataLoader(ecg_dataset, batch_size=32, shuffle=True, drop_last=True)
+mri_loader = DataLoader(mri_dataset, batch_size=32, shuffle=True, drop_last=True)
+
+# 處理臨床數據集
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y.values, dtype=torch.long)
+clinical_dataset = ClinicalDataset(X_tensor, y_tensor)
+clinical_loader = DataLoader(clinical_dataset, batch_size=32, shuffle=True, drop_last=True)
+
+# 定義多模態模型
+class MultimodalModel(nn.Module):
+    def __init__(self, hidden_size, num_classes, clinical_features):
+        super(MultimodalModel, self).__init__()
+        # ECG CNN 模型
+        self.ecg_encoder = models.resnet50(pretrained=True)
+        self.ecg_encoder.fc = nn.Linear(self.ecg_encoder.fc.in_features, hidden_size)
+
+        # MRI CNN 模型
+        self.mri_encoder = models.resnet50(pretrained=True)
+        self.mri_encoder.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.mri_encoder.fc = nn.Linear(self.mri_encoder.fc.in_features, hidden_size)
+
+        # 融合層
+        self.fc1 = nn.Linear(hidden_size * 2 + clinical_features, hidden_size)
+        self.fc = nn.Linear(hidden_size, 4)  # 輸出 4 類別
+
+    def forward(self, ecg, mri, clinical):
+        ecg_features = self.ecg_encoder(ecg)
+        mri_features = self.mri_encoder(mri)
+        clinical = clinical.view(clinical.size(0), -1)
+        x = torch.cat((ecg_features, mri_features, clinical), dim=1)
+        x = self.fc1(x)
+        x = self.fc(x)
+        return x
+
+# 訓練過程
+def train_model(model, train_loader, ecg_loader, mri_loader, epochs=10, lr=1e-4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        # 初始化預測結果與真實標籤
+        all_predictions = []  # 儲存每一批次的預測結果
+        all_labels = []  # 儲存每一批次的真實標籤
+
+        for (ecg_data, mri_data, (clinical_batch, labels)) in zip(ecg_loader, mri_loader, train_loader):
+            if ecg_data.size(0) != mri_data.size(0) or ecg_data.size(0) != clinical_batch.size(0):
+                continue
+
+            ecg_data, mri_data = ecg_data.to(device), mri_data.to(device)
+            clinical_batch, labels = clinical_batch.to(device), labels.to(device)
+
+            labels = labels - 1  # 假設標籤是從1開始，所以需要減1以便與預測對應
+            outputs = model(ecg_data, mri_data, clinical_batch)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+            # 計算準確率
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+            # 儲存預測結果和真實標籤
+            all_predictions.append((predicted + 1).cpu().numpy())  # 将预测标签加 1
+            all_labels.append((labels + 1).cpu().numpy())  # 将真实标签加 1
+
+        avg_loss = running_loss / len(train_loader)
+        accuracy = (correct / total) * 100
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
+            # 計算 F1 分數
+        all_predictions = np.concatenate(all_predictions)
+        all_labels = np.concatenate(all_labels)
+        f1 = f1_score(all_labels, all_predictions, average='weighted')  # weighted 是加權 F1 分數
+        print(f"F1 Score for Epoch {epoch + 1}: {f1:.4f}")
+        scheduler.step(avg_loss)
+
+        # 在最後一個 epoch 結束後列出前十個預測結果
+        if epoch == epochs - 1:  # 最後一個 epoch
+            all_predictions = np.concatenate(all_predictions)
+            all_labels = np.concatenate(all_labels)
+
+            # 顯示前十個預測結果
+            print(f"Top 10 Predictions in Epoch {epoch + 1}:")
+            print(f"True Labels: {all_labels[:10]}")
+            print(f"Predicted Labels: {all_predictions[:10]}")
+
+            # 儲存結果到 CSV 檔案
+            result_df = pd.DataFrame({
+                'True Labels': all_labels[:10],
+                'Predicted Labels': all_predictions[:10]
+            })
+            result_df.to_csv(f"epoch_{epoch+1}_top_10_predictions.csv", index=False)
+
+
+# 初始化模型與訓練
+model = MultimodalModel(hidden_size=256, num_classes=4, clinical_features=X.shape[1])
+train_model(model, clinical_loader, ecg_loader, mri_loader, epochs=20, lr=1e-4)
+
+
+
+
+
+
+
+
